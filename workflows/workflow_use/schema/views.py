@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 # --- Base Step Model ---
@@ -237,7 +237,8 @@ class WorkflowDefinitionSchema(BaseModel):
 		description='List of input schema definitions.',
 	)
 
-	@validator('steps')
+	@field_validator('steps')
+	@classmethod
 	def validate_ends_with_extract(cls, steps: List[WorkflowStep]) -> List[WorkflowStep]:
 		"""Validate that the workflow ends with an extract step."""
 		if not steps:
