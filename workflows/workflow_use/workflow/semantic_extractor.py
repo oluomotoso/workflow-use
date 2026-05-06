@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import aiofiles
 
@@ -11,11 +11,533 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# JavaScript payload that installs ``window.__wfu_extract`` on the page.
+# Installed once per Page via ``add_init_script`` (covers future navigations)
+# plus a one-time ``page.evaluate`` (covers the current page state). After
+# install, ``extract_interactive_elements`` invokes the pre-installed function
+# with a tiny payload — saving the 50-200ms-per-call cost of re-shipping the
+# 5KB body to remote-CDP browsers (Steel.dev, browserless, etc.).
+_EXTRACTOR_INIT_JS = r"""
+(() => {
+	if (window.__wfu_extract) {
+		return;
+	}
+	window.__wfu_extract = function(debugMode = false) {
+		const debugLog = [];
+
+		function debugMessage(msg, data = null) {
+			if (debugMode) {
+				console.log('[SEMANTIC_DEBUG]', msg, data);
+				debugLog.push({ message: msg, data: data, timestamp: Date.now() });
+			}
+		}
+
+		debugMessage('Starting semantic extraction');
+
+		// Enhanced selector for complex UI widgets
+		const interactiveSelectors = [
+			'button', 'input', 'select', 'textarea', 'a[href]',
+			'[role="button"]', '[role="link"]', '[role="tab"]', '[role="menuitem"]',
+			'[role="option"]', '[role="checkbox"]', '[role="radio"]',
+			'[role="combobox"]', '[role="listbox"]', '[role="slider"]',
+			'[role="spinbutton"]', '[role="searchbox"]', '[role="switch"]',
+			'[onclick]', '[onchange]', '[onsubmit]',
+			// Calendar and date picker elements
+			'[role="gridcell"]', '[role="calendar"]', '[role="datepicker"]',
+			'.calendar-day', '.date-picker', '.day', '.month', '.year',
+			'[data-date]', '[data-day]', '[data-month]', '[data-year]',
+			// Dropdown and menu elements
+			'[role="menu"]', '[role="menubar"]', '[role="menuitem"]',
+			'.dropdown', '.menu-item', '.option', '.select-option',
+			'[data-value]', '[data-option]',
+			// Dynamic content elements
+			'[data-testid]', '[data-cy]', '[data-qa]',
+			// Flight/travel specific elements
+			'.flight-option', '.price', '.select-flight', '.book-now',
+			'[data-flight]', '[data-price]', '.fare-option'
+		].join(', ');
+
+		const elements = [];
+		let allElements;
+
+		try {
+			allElements = document.querySelectorAll(interactiveSelectors);
+			debugMessage(`Found ${allElements.length} potential interactive elements`);
+		} catch (error) {
+			debugMessage('Error selecting elements', error.message);
+			return { elements: [], debugLog: debugLog, error: error.message };
+		}
+
+		// Enhanced context extraction functions with error handling
+		function safeGetWidgetType(el) {
+			try {
+				const role = el.getAttribute('role') || '';
+				const className = (el.className || '').toString().toLowerCase();
+				const tagName = el.tagName.toLowerCase();
+				const dataAttrs = Array.from(el.attributes || [])
+					.filter(attr => attr.name && attr.name.startsWith('data-'))
+					.map(attr => attr.name);
+
+				if (role === 'gridcell' || role === 'calendar' ||
+					className.includes('calendar') || className.includes('date') ||
+					dataAttrs.some(attr => attr.includes('date') || attr.includes('day'))) {
+					return 'calendar';
+				}
+
+				if (role === 'option' || role === 'menuitem' || role === 'combobox' ||
+					className.includes('dropdown') || className.includes('option') ||
+					className.includes('menu')) {
+					return 'dropdown';
+				}
+
+				if (className.includes('flight') || className.includes('select') ||
+					className.includes('book') || className.includes('fare') ||
+					dataAttrs.some(attr => attr.includes('flight') || attr.includes('price'))) {
+					return 'booking';
+				}
+
+				if (tagName === 'input' || tagName === 'select' || tagName === 'textarea') {
+					return 'form';
+				}
+
+				if (tagName === 'button' || role === 'button' || tagName === 'a') {
+					return 'action';
+				}
+
+				return 'generic';
+			} catch (error) {
+				debugMessage('Error in safeGetWidgetType', { element: el.tagName, error: error.message });
+				return 'error';
+			}
+		}
+
+		function safeGetCalendarContext(el) {
+			try {
+				const context = {};
+				const dateAttr = el.getAttribute('data-date') ||
+					el.getAttribute('data-day') ||
+					el.getAttribute('aria-label');
+				if (dateAttr) {
+					context.date_value = dateAttr;
+				}
+				const calendar = el.closest('[role="calendar"], .calendar, .date-picker, .datepicker');
+				if (calendar) {
+					context.calendar_type = calendar.className || 'calendar';
+					const calendarContainer = calendar.closest('[data-testid], [class*="depart"], [class*="return"]');
+					if (calendarContainer) {
+						const containerClass = (calendarContainer.className || '').toLowerCase();
+						if (containerClass.includes('depart')) {
+							context.date_type = 'departure';
+						} else if (containerClass.includes('return')) {
+							context.date_type = 'return';
+						}
+					}
+				}
+				const monthYear = el.closest('.month, .year, [data-month], [data-year]');
+				if (monthYear) {
+					context.period_context = monthYear.textContent?.trim() || monthYear.getAttribute('data-month') || monthYear.getAttribute('data-year');
+				}
+				return context;
+			} catch (error) {
+				debugMessage('Error in safeGetCalendarContext', error.message);
+				return {};
+			}
+		}
+
+		function safeGetDropdownContext(el) {
+			try {
+				const context = {};
+				const dropdown = el.closest('[role="listbox"], [role="menu"], .dropdown, .select-menu');
+				if (dropdown) {
+					context.dropdown_type = dropdown.className || 'dropdown';
+					const label = dropdown.closest('label') ||
+						document.querySelector(`label[for="${dropdown.id}"]`) ||
+						dropdown.previousElementSibling;
+					if (label) {
+						context.dropdown_purpose = label.textContent?.trim();
+					}
+				}
+				const value = el.getAttribute('data-value') || el.getAttribute('value');
+				if (value) {
+					context.option_value = value;
+				}
+				return context;
+			} catch (error) {
+				debugMessage('Error in safeGetDropdownContext', error.message);
+				return {};
+			}
+		}
+
+		function safeGetBookingContext(el) {
+			try {
+				const context = {};
+				const bookingContainer = el.closest('.flight-option, .booking-option, [data-flight]');
+				if (bookingContainer) {
+					const priceEl = bookingContainer.querySelector('.price, [data-price], .fare');
+					if (priceEl) {
+						context.price = priceEl.textContent?.trim();
+					}
+					const airlineEl = bookingContainer.querySelector('.airline, .carrier');
+					if (airlineEl) {
+						context.airline = airlineEl.textContent?.trim();
+					}
+					const timeEl = bookingContainer.querySelector('.time, .departure, .arrival');
+					if (timeEl) {
+						context.time_info = timeEl.textContent?.trim();
+					}
+					const flightType = bookingContainer.closest('[data-direction], [class*="outbound"], [class*="return"]');
+					if (flightType) {
+						const typeClass = (flightType.className || '').toLowerCase();
+						if (typeClass.includes('outbound')) {
+							context.flight_direction = 'outbound';
+						} else if (typeClass.includes('return')) {
+							context.flight_direction = 'return';
+						}
+					}
+				}
+				return context;
+			} catch (error) {
+				debugMessage('Error in safeGetBookingContext', error.message);
+				return {};
+			}
+		}
+
+		function safeGetContainerContext(el) {
+			try {
+				const context = {};
+				const container = el.closest('section, form, fieldset, div[class], div[id], article, main, aside');
+				if (container) {
+					context.type = container.tagName.toLowerCase();
+					context.id = container.id || '';
+					context.className = container.className || '';
+					const containerText = container.textContent?.trim();
+					if (containerText) {
+						const words = containerText.split(/\s+/).slice(0, 5).join(' ');
+						context.text = words.length < containerText.length ? words + '...' : words;
+					}
+				}
+				return context;
+			} catch (error) {
+				debugMessage('Error in safeGetContainerContext', error.message);
+				return {};
+			}
+		}
+
+		function safeGetSiblingContext(el) {
+			try {
+				const context = {};
+				const parent = el.parentElement;
+				if (parent) {
+					const siblings = Array.from(parent.children).filter(child =>
+						child.tagName === el.tagName ||
+						child.getAttribute('role') === el.getAttribute('role')
+					);
+					if (siblings.length > 1) {
+						context.position = siblings.indexOf(el);
+						context.total = siblings.length;
+					}
+				}
+				return context;
+			} catch (error) {
+				debugMessage('Error in safeGetSiblingContext', error.message);
+				return {};
+			}
+		}
+
+		function safeGetDOMPath(el) {
+			try {
+				const path = [];
+				let current = el;
+				while (current && current !== document.body && path.length < 5) {
+					let selector = current.tagName.toLowerCase();
+					if (current.id) {
+						selector += `#${current.id}`;
+						path.unshift(selector);
+						break;
+					} else if (current.className) {
+						const firstClass = (current.className || '').toString().split(' ')[0];
+						if (firstClass && firstClass.match(/^[a-zA-Z_-][a-zA-Z0-9_-]*$/)) {
+							selector += `.${firstClass}`;
+						}
+					}
+					const siblings = Array.from(current.parentElement?.children || [])
+						.filter(el => el.tagName === current.tagName);
+					if (siblings.length > 1) {
+						const index = siblings.indexOf(current) + 1;
+						selector += `:nth-of-type(${index})`;
+					}
+					path.unshift(selector);
+					current = current.parentElement;
+				}
+				return path.join(' > ');
+			} catch (error) {
+				debugMessage('Error in safeGetDOMPath', error.message);
+				return '';
+			}
+		}
+
+		function safeGetLabelText(el) {
+			try {
+				let labelText = '';
+				if (el.id) {
+					const label = document.querySelector(`label[for="${el.id}"]`);
+					if (label) {
+						labelText = label.textContent?.trim() || '';
+					}
+				}
+				if (!labelText) {
+					const label = el.closest('label');
+					if (label) {
+						labelText = label.textContent?.trim() || '';
+					}
+				}
+				if (!labelText) {
+					const prevElement = el.previousElementSibling;
+					if (prevElement && (prevElement.tagName === 'LABEL' || prevElement.textContent)) {
+						labelText = prevElement.textContent?.trim() || '';
+					}
+				}
+				if (!labelText) {
+					const parentCell = el.closest('td, th');
+					if (parentCell) {
+						const prevCell = parentCell.previousElementSibling;
+						if (prevCell && (prevCell.tagName === 'TD' || prevCell.tagName === 'TH')) {
+							const cellText = prevCell.textContent?.trim() || '';
+							if (cellText && cellText.length < 50) {
+								labelText = cellText.replace(/[:：]\s*$/, '').trim();
+							}
+						}
+					}
+				}
+				return labelText;
+			} catch (error) {
+				debugMessage('Error in safeGetLabelText', error.message);
+				return '';
+			}
+		}
+
+		function safeGetParentText(el) {
+			try {
+				const parent = el.parentElement;
+				if (!parent) return '';
+				const parentText = Array.from(parent.childNodes)
+					.filter(node => node.nodeType === Node.TEXT_NODE)
+					.map(node => node.textContent?.trim())
+					.filter(text => text)
+					.join(' ');
+				return parentText;
+			} catch (error) {
+				debugMessage('Error in safeGetParentText', error.message);
+				return '';
+			}
+		}
+
+		function safeGetEnhancedContainerContext(el) {
+			try {
+				const context = safeGetContainerContext(el);
+				const widgetType = safeGetWidgetType(el);
+				context.widget_type = widgetType;
+				switch (widgetType) {
+					case 'calendar':
+						Object.assign(context, safeGetCalendarContext(el));
+						break;
+					case 'dropdown':
+						Object.assign(context, safeGetDropdownContext(el));
+						break;
+					case 'booking':
+						Object.assign(context, safeGetBookingContext(el));
+						break;
+				}
+				return context;
+			} catch (error) {
+				debugMessage('Error in safeGetEnhancedContainerContext', { element: el.tagName, error: error.message });
+				return { widget_type: 'error' };
+			}
+		}
+
+		function safeGetInteractionHints(el) {
+			try {
+				const hints = [];
+				const widgetType = safeGetWidgetType(el);
+				switch (widgetType) {
+					case 'calendar':
+						hints.push('click_date');
+						if (el.getAttribute('aria-selected') === 'true') {
+							hints.push('selected_date');
+						}
+						break;
+					case 'dropdown':
+						hints.push('select_option');
+						if (el.getAttribute('aria-expanded') === 'true') {
+							hints.push('expanded');
+						}
+						break;
+					case 'booking':
+						hints.push('select_flight');
+						if (el.textContent?.toLowerCase().includes('select')) {
+							hints.push('selection_button');
+						}
+						break;
+				}
+				return hints;
+			} catch (error) {
+				debugMessage('Error in safeGetInteractionHints', error.message);
+				return [];
+			}
+		}
+
+		let processedCount = 0;
+		let errorCount = 0;
+
+		Array.from(allElements).forEach((el, index) => {
+			try {
+				const rect = el.getBoundingClientRect();
+				if (rect.width === 0 || rect.height === 0 ||
+					getComputedStyle(el).visibility === 'hidden' ||
+					getComputedStyle(el).display === 'none') {
+					return;
+				}
+				const containerContext = safeGetEnhancedContainerContext(el);
+				const interactionHints = safeGetInteractionHints(el);
+				let selector = '';
+				let hierarchicalSelector = '';
+				try {
+					if (el.id) {
+						selector = `#${el.id}`;
+					} else {
+						selector = el.tagName.toLowerCase();
+						const widgetType = containerContext.widget_type;
+						if (widgetType === 'calendar' && el.getAttribute('data-date')) {
+							selector += `[data-date="${el.getAttribute('data-date')}"]`;
+						} else if (widgetType === 'dropdown' && el.getAttribute('data-value')) {
+							selector += `[data-value="${el.getAttribute('data-value')}"]`;
+						} else if (el.getAttribute('data-testid')) {
+							selector += `[data-testid="${el.getAttribute('data-testid')}"]`;
+						}
+						if (el.name) selector += `[name="${el.name}"]`;
+						if (el.type && el.type !== 'submit' && el.type !== 'button' && el.type !== '') {
+							selector += `[type="${el.type}"]`;
+						}
+					}
+					hierarchicalSelector = safeGetDOMPath(el);
+				} catch (error) {
+					debugMessage('Error generating selector', { element: el.tagName, error: error.message });
+					selector = el.tagName.toLowerCase();
+					hierarchicalSelector = selector;
+				}
+				let elementText = '';
+				try {
+					elementText = el.textContent?.trim() || '';
+					if (!elementText && el.getAttribute('aria-label')) {
+						elementText = el.getAttribute('aria-label');
+					} else if (!elementText && el.getAttribute('title')) {
+						elementText = el.getAttribute('title');
+					} else if (!elementText && el.getAttribute('placeholder')) {
+						elementText = el.getAttribute('placeholder');
+					}
+				} catch (error) {
+					debugMessage('Error extracting text', error.message);
+				}
+				const elementData = {
+					tag: el.tagName,
+					type: el.type || '',
+					role: el.getAttribute('role') || '',
+					id: el.id || '',
+					name: el.name || '',
+					class: el.className || '',
+					text_content: elementText,
+					placeholder: el.placeholder || '',
+					title: el.title || '',
+					aria_label: el.getAttribute('aria-label') || '',
+					value: el.value || '',
+					label_text: safeGetLabelText(el),
+					parent_text: safeGetParentText(el),
+					css_selector: selector,
+					hierarchical_selector: hierarchicalSelector,
+					fallback_selector: el.tagName.toLowerCase(),
+					text_xpath: elementText ? `//${el.tagName.toLowerCase()}[contains(text(), "${elementText}")]` : '',
+					dom_path: hierarchicalSelector,
+					container_context: containerContext,
+					sibling_context: safeGetSiblingContext(el),
+					interaction_hints: interactionHints,
+					widget_data: {
+						date_value: el.getAttribute('data-date'),
+						option_value: el.getAttribute('data-value'),
+						test_id: el.getAttribute('data-testid'),
+						flight_data: el.getAttribute('data-flight'),
+						price_data: el.getAttribute('data-price')
+					},
+					position: {
+						x: Math.round(rect.x),
+						y: Math.round(rect.y),
+						width: Math.round(rect.width),
+						height: Math.round(rect.height)
+					}
+				};
+				elements.push(elementData);
+				processedCount++;
+			} catch (error) {
+				errorCount++;
+				debugMessage('Error processing element', {
+					index: index,
+					element: el.tagName,
+					error: error.message
+				});
+			}
+		});
+
+		debugMessage('Extraction complete', {
+			processed: processedCount,
+			errors: errorCount,
+			total: allElements.length
+		});
+
+		return {
+			elements: elements,
+			debugLog: debugLog,
+			stats: {
+				processed: processedCount,
+				errors: errorCount,
+				total: allElements.length
+			}
+		};
+	};
+})();
+"""
+
+
 class SemanticExtractor:
 	"""Extracts semantic mappings from HTML pages by mapping visible text to deterministic selectors."""
 
 	def __init__(self):
 		self.element_counters = {'input': 0, 'button': 0, 'select': 0, 'textarea': 0, 'a': 0, 'radio': 0, 'checkbox': 0}
+		# Track which Page objects have already had the extractor JS installed.
+		# We key on id(page) so the same Page instance only pays the install cost
+		# once. New tabs / new sessions get their own install.
+		self._installed_pages: Set[int] = set()
+
+	async def _ensure_installed(self, page: 'Page') -> None:
+		"""Install ``window.__wfu_extract`` on the page exactly once per Page object.
+
+		Uses ``add_init_script`` so the install survives navigation, plus a
+		one-shot ``page.evaluate`` so the function is callable on the current
+		document (init scripts only run on subsequent navigations).
+		"""
+		page_key = id(page)
+		if page_key in self._installed_pages:
+			return
+		try:
+			await page.add_init_script(_EXTRACTOR_INIT_JS)
+		except Exception as e:
+			# Some Page implementations (e.g. CDP-only relays) may not support
+			# add_init_script. Fall back to evaluate-only — slower but correct.
+			logger.debug(f'add_init_script unavailable; falling back to evaluate-only: {e}')
+		try:
+			await page.evaluate(_EXTRACTOR_INIT_JS)
+		except Exception as e:
+			logger.warning(f'Failed to install __wfu_extract via evaluate: {e}')
+			return
+		self._installed_pages.add(page_key)
 
 	def _reset_counters(self):
 		"""Reset element counters for a new page."""
@@ -204,594 +726,42 @@ class SemanticExtractor:
 		return f'{text} ({counter})'
 
 	async def extract_interactive_elements(self, page: 'Page') -> List[Dict]:
-		"""Extract interactive elements with enhanced context for complex UI widgets."""
+		"""Extract interactive elements with enhanced context for complex UI widgets.
+
+		The extractor JS is installed once per ``Page`` object via
+		``_ensure_installed`` (using ``add_init_script`` + a one-shot
+		``page.evaluate``). Subsequent calls invoke the pre-installed
+		``window.__wfu_extract`` function with a tiny payload — saving
+		50-200ms-per-call on remote-CDP setups (Steel.dev, browserless).
+		"""
 
 		# Add debugging flag
 		debug_mode = False  # Set to True for debugging
 
-		js_code = """
-        (debugMode = false) => {
-            const debugLog = [];
-            
-            function debugMessage(msg, data = null) {
-                if (debugMode) {
-                    console.log('[SEMANTIC_DEBUG]', msg, data);
-                    debugLog.push({ message: msg, data: data, timestamp: Date.now() });
-                }
-            }
-            
-            debugMessage('Starting semantic extraction');
-            
-            // Enhanced selector for complex UI widgets
-            const interactiveSelectors = [
-                'button', 'input', 'select', 'textarea', 'a[href]',
-                '[role="button"]', '[role="link"]', '[role="tab"]', '[role="menuitem"]',
-                '[role="option"]', '[role="checkbox"]', '[role="radio"]',
-                '[role="combobox"]', '[role="listbox"]', '[role="slider"]',
-                '[role="spinbutton"]', '[role="searchbox"]', '[role="switch"]',
-                '[onclick]', '[onchange]', '[onsubmit]',
-                // Calendar and date picker elements
-                '[role="gridcell"]', '[role="calendar"]', '[role="datepicker"]',
-                '.calendar-day', '.date-picker', '.day', '.month', '.year',
-                '[data-date]', '[data-day]', '[data-month]', '[data-year]',
-                // Dropdown and menu elements
-                '[role="menu"]', '[role="menubar"]', '[role="menuitem"]',
-                '.dropdown', '.menu-item', '.option', '.select-option',
-                '[data-value]', '[data-option]',
-                // Dynamic content elements
-                '[data-testid]', '[data-cy]', '[data-qa]',
-                // Flight/travel specific elements
-                '.flight-option', '.price', '.select-flight', '.book-now',
-                '[data-flight]', '[data-price]', '.fare-option'
-            ].join(', ');
-            
-            const elements = [];
-            let allElements;
-            
-            try {
-                allElements = document.querySelectorAll(interactiveSelectors);
-                debugMessage(`Found ${allElements.length} potential interactive elements`);
-            } catch (error) {
-                debugMessage('Error selecting elements', error.message);
-                return { elements: [], debugLog: debugLog, error: error.message };
-            }
-            
-            // Enhanced context extraction functions with error handling
-            function safeGetWidgetType(el) {
-                try {
-                    // Detect widget types based on various indicators
-                    const role = el.getAttribute('role') || '';
-                    const className = (el.className || '').toString().toLowerCase();
-                    const tagName = el.tagName.toLowerCase();
-                    const dataAttrs = Array.from(el.attributes || [])
-                        .filter(attr => attr.name && attr.name.startsWith('data-'))
-                        .map(attr => attr.name);
-                    
-                    // Calendar detection
-                    if (role === 'gridcell' || role === 'calendar' || 
-                        className.includes('calendar') || className.includes('date') ||
-                        dataAttrs.some(attr => attr.includes('date') || attr.includes('day'))) {
-                        return 'calendar';
-                    }
-                    
-                    // Dropdown detection
-                    if (role === 'option' || role === 'menuitem' || role === 'combobox' ||
-                        className.includes('dropdown') || className.includes('option') ||
-                        className.includes('menu')) {
-                        return 'dropdown';
-                    }
-                    
-                    // Flight/booking specific
-                    if (className.includes('flight') || className.includes('select') ||
-                        className.includes('book') || className.includes('fare') ||
-                        dataAttrs.some(attr => attr.includes('flight') || attr.includes('price'))) {
-                        return 'booking';
-                    }
-                    
-                    // Form controls
-                    if (tagName === 'input' || tagName === 'select' || tagName === 'textarea') {
-                        return 'form';
-                    }
-                    
-                    // Navigation/action buttons
-                    if (tagName === 'button' || role === 'button' || tagName === 'a') {
-                        return 'action';
-                    }
-                    
-                    return 'generic';
-                } catch (error) {
-                    debugMessage('Error in safeGetWidgetType', { element: el.tagName, error: error.message });
-                    return 'error';
-                }
-            }
-            
-            function safeGetCalendarContext(el) {
-                try {
-                    const context = {};
-                    
-                    // Try to find date information
-                    const dateAttr = el.getAttribute('data-date') || 
-                                   el.getAttribute('data-day') ||
-                                   el.getAttribute('aria-label');
-                    
-                    if (dateAttr) {
-                        context.date_value = dateAttr;
-                    }
-                    
-                    // Find calendar container
-                    const calendar = el.closest('[role="calendar"], .calendar, .date-picker, .datepicker');
-                    if (calendar) {
-                        context.calendar_type = calendar.className || 'calendar';
-                        
-                        // Try to determine if it's departure or return date
-                        const calendarContainer = calendar.closest('[data-testid], [class*="depart"], [class*="return"]');
-                        if (calendarContainer) {
-                            const containerClass = (calendarContainer.className || '').toLowerCase();
-                            if (containerClass.includes('depart')) {
-                                context.date_type = 'departure';
-                            } else if (containerClass.includes('return')) {
-                                context.date_type = 'return';
-                            }
-                        }
-                    }
-                    
-                    // Check for month/year context
-                    const monthYear = el.closest('.month, .year, [data-month], [data-year]');
-                    if (monthYear) {
-                        context.period_context = monthYear.textContent?.trim() || monthYear.getAttribute('data-month') || monthYear.getAttribute('data-year');
-                    }
-                    
-                    return context;
-                } catch (error) {
-                    debugMessage('Error in safeGetCalendarContext', error.message);
-                    return {};
-                }
-            }
-            
-            function safeGetDropdownContext(el) {
-                try {
-                    const context = {};
-                    
-                    // Find dropdown container
-                    const dropdown = el.closest('[role="listbox"], [role="menu"], .dropdown, .select-menu');
-                    if (dropdown) {
-                        context.dropdown_type = dropdown.className || 'dropdown';
-                        
-                        // Try to determine dropdown purpose
-                        const label = dropdown.closest('label') || 
-                                     document.querySelector(`label[for="${dropdown.id}"]`) ||
-                                     dropdown.previousElementSibling;
-                        
-                        if (label) {
-                            context.dropdown_purpose = label.textContent?.trim();
-                        }
-                    }
-                    
-                    // Get option value and text
-                    const value = el.getAttribute('data-value') || el.getAttribute('value');
-                    if (value) {
-                        context.option_value = value;
-                    }
-                    
-                    return context;
-                } catch (error) {
-                    debugMessage('Error in safeGetDropdownContext', error.message);
-                    return {};
-                }
-            }
-            
-            function safeGetBookingContext(el) {
-                try {
-                    const context = {};
-                    
-                    // Find flight/booking container
-                    const bookingContainer = el.closest('.flight-option, .booking-option, [data-flight]');
-                    if (bookingContainer) {
-                        // Extract flight details
-                        const priceEl = bookingContainer.querySelector('.price, [data-price], .fare');
-                        if (priceEl) {
-                            context.price = priceEl.textContent?.trim();
-                        }
-                        
-                        const airlineEl = bookingContainer.querySelector('.airline, .carrier');
-                        if (airlineEl) {
-                            context.airline = airlineEl.textContent?.trim();
-                        }
-                        
-                        const timeEl = bookingContainer.querySelector('.time, .departure, .arrival');
-                        if (timeEl) {
-                            context.time_info = timeEl.textContent?.trim();
-                        }
-                        
-                        // Try to determine if it's outbound or return flight
-                        const flightType = bookingContainer.closest('[data-direction], [class*="outbound"], [class*="return"]');
-                        if (flightType) {
-                            const typeClass = (flightType.className || '').toLowerCase();
-                            if (typeClass.includes('outbound')) {
-                                context.flight_direction = 'outbound';
-                            } else if (typeClass.includes('return')) {
-                                context.flight_direction = 'return';
-                            }
-                        }
-                    }
-                    
-                    return context;
-                } catch (error) {
-                    debugMessage('Error in safeGetBookingContext', error.message);
-                    return {};
-                }
-            }
-            
-            // Helper functions that were missing (with error handling)
-            function safeGetContainerContext(el) {
-                try {
-                    const context = {};
-                    
-                    // Find the closest meaningful container
-                    const container = el.closest('section, form, fieldset, div[class], div[id], article, main, aside');
-                    if (container) {
-                        context.type = container.tagName.toLowerCase();
-                        context.id = container.id || '';
-                        context.className = container.className || '';
-                        
-                        // Get container text (first few words)
-                        const containerText = container.textContent?.trim();
-                        if (containerText) {
-                            const words = containerText.split(/\\s+/).slice(0, 5).join(' ');
-                            context.text = words.length < containerText.length ? words + '...' : words;
-                        }
-                    }
-                    
-                    return context;
-                } catch (error) {
-                    debugMessage('Error in safeGetContainerContext', error.message);
-                    return {};
-                }
-            }
-            
-            function safeGetSiblingContext(el) {
-                try {
-                    const context = {};
-                    const parent = el.parentElement;
-                    
-                    if (parent) {
-                        const siblings = Array.from(parent.children).filter(child => 
-                            child.tagName === el.tagName || 
-                            child.getAttribute('role') === el.getAttribute('role')
-                        );
-                        
-                        if (siblings.length > 1) {
-                            context.position = siblings.indexOf(el);
-                            context.total = siblings.length;
-                        }
-                    }
-                    
-                    return context;
-                } catch (error) {
-                    debugMessage('Error in safeGetSiblingContext', error.message);
-                    return {};
-                }
-            }
-            
-            function safeGetDOMPath(el) {
-                try {
-                    const path = [];
-                    let current = el;
-                    
-                    while (current && current !== document.body && path.length < 5) {
-                        let selector = current.tagName.toLowerCase();
-                        
-                        if (current.id) {
-                            selector += `#${current.id}`;
-                            path.unshift(selector);
-                            break;
-                        } else if (current.className) {
-                            const firstClass = (current.className || '').toString().split(' ')[0];
-                            if (firstClass && firstClass.match(/^[a-zA-Z_-][a-zA-Z0-9_-]*$/)) {
-                                selector += `.${firstClass}`;
-                            }
-                        }
-                        
-                        // Add nth-of-type if needed
-                        const siblings = Array.from(current.parentElement?.children || [])
-                            .filter(el => el.tagName === current.tagName);
-                        if (siblings.length > 1) {
-                            const index = siblings.indexOf(current) + 1;
-                            selector += `:nth-of-type(${index})`;
-                        }
-                        
-                        path.unshift(selector);
-                        current = current.parentElement;
-                    }
-                    
-                    return path.join(' > ');
-                } catch (error) {
-                    debugMessage('Error in safeGetDOMPath', error.message);
-                    return '';
-                }
-            }
-            
-            function safeGetLabelText(el) {
-                try {
-                    // Try to find associated label
-                    let labelText = '';
-                    
-                    if (el.id) {
-                        const label = document.querySelector(`label[for="${el.id}"]`);
-                        if (label) {
-                            labelText = label.textContent?.trim() || '';
-                        }
-                    }
-                    
-                    if (!labelText) {
-                        const label = el.closest('label');
-                        if (label) {
-                            labelText = label.textContent?.trim() || '';
-                        }
-                    }
-                    
-                    if (!labelText) {
-                        const prevElement = el.previousElementSibling;
-                        if (prevElement && (prevElement.tagName === 'LABEL' || prevElement.textContent)) {
-                            labelText = prevElement.textContent?.trim() || '';
-                        }
-                    }
-
-                    // IMPORTANT: Handle table structures where label is in previous <td>
-                    if (!labelText) {
-                        const parentCell = el.closest('td, th');
-                        if (parentCell) {
-                            const prevCell = parentCell.previousElementSibling;
-                            if (prevCell && (prevCell.tagName === 'TD' || prevCell.tagName === 'TH')) {
-                                const cellText = prevCell.textContent?.trim() || '';
-                                // Only use if it looks like a label (short text, ends with colon, etc.)
-                                if (cellText && cellText.length < 50) {
-                                    labelText = cellText.replace(/[:：]\s*$/, '').trim();
-                                }
-                            }
-                        }
-                    }
-
-                    return labelText;
-                } catch (error) {
-                    debugMessage('Error in safeGetLabelText', error.message);
-                    return '';
-                }
-            }
-            
-            function safeGetParentText(el) {
-                try {
-                    const parent = el.parentElement;
-                    if (!parent) return '';
-                    
-                    // Get direct text content of parent (not including children)
-                    const parentText = Array.from(parent.childNodes)
-                        .filter(node => node.nodeType === Node.TEXT_NODE)
-                        .map(node => node.textContent?.trim())
-                        .filter(text => text)
-                        .join(' ');
-                    
-                    return parentText;
-                } catch (error) {
-                    debugMessage('Error in safeGetParentText', error.message);
-                    return '';
-                }
-            }
-            
-            function safeGetEnhancedContainerContext(el) {
-                try {
-                    const context = safeGetContainerContext(el);
-                    
-                    // Add widget-specific context
-                    const widgetType = safeGetWidgetType(el);
-                    context.widget_type = widgetType;
-                    
-                    switch (widgetType) {
-                        case 'calendar':
-                            Object.assign(context, safeGetCalendarContext(el));
-                            break;
-                        case 'dropdown':
-                            Object.assign(context, safeGetDropdownContext(el));
-                            break;
-                        case 'booking':
-                            Object.assign(context, safeGetBookingContext(el));
-                            break;
-                    }
-                    
-                    return context;
-                } catch (error) {
-                    debugMessage('Error in safeGetEnhancedContainerContext', { element: el.tagName, error: error.message });
-                    return { widget_type: 'error' };
-                }
-            }
-            
-            function safeGetInteractionHints(el) {
-                try {
-                    const hints = [];
-                    const widgetType = safeGetWidgetType(el);
-                    
-                    switch (widgetType) {
-                        case 'calendar':
-                            hints.push('click_date');
-                            if (el.getAttribute('aria-selected') === 'true') {
-                                hints.push('selected_date');
-                            }
-                            break;
-                        case 'dropdown':
-                            hints.push('select_option');
-                            if (el.getAttribute('aria-expanded') === 'true') {
-                                hints.push('expanded');
-                            }
-                            break;
-                        case 'booking':
-                            hints.push('select_flight');
-                            if (el.textContent?.toLowerCase().includes('select')) {
-                                hints.push('selection_button');
-                            }
-                            break;
-                    }
-                    
-                    return hints;
-                } catch (error) {
-                    debugMessage('Error in safeGetInteractionHints', error.message);
-                    return [];
-                }
-            }
-            
-            // Process each element with enhanced context and error handling
-            let processedCount = 0;
-            let errorCount = 0;
-            
-            Array.from(allElements).forEach((el, index) => {
-                try {
-                    const rect = el.getBoundingClientRect();
-                    
-                    // Skip hidden elements
-                    if (rect.width === 0 || rect.height === 0 || 
-                        getComputedStyle(el).visibility === 'hidden' ||
-                        getComputedStyle(el).display === 'none') {
-                        return;
-                    }
-                    
-                    // Get enhanced context with error handling
-                    const containerContext = safeGetEnhancedContainerContext(el);
-                    const interactionHints = safeGetInteractionHints(el);
-                    
-                    // Generate selector with error handling
-                    let selector = '';
-                    let hierarchicalSelector = '';
-                    
-                    try {
-                        if (el.id) {
-                            selector = `#${el.id}`;
-                        } else {
-                            selector = el.tagName.toLowerCase();
-
-                            // Add specific attributes based on widget type
-                            const widgetType = containerContext.widget_type;
-                            if (widgetType === 'calendar' && el.getAttribute('data-date')) {
-                                selector += `[data-date="${el.getAttribute('data-date')}"]`;
-                            } else if (widgetType === 'dropdown' && el.getAttribute('data-value')) {
-                                selector += `[data-value="${el.getAttribute('data-value')}"]`;
-                            } else if (el.getAttribute('data-testid')) {
-                                selector += `[data-testid="${el.getAttribute('data-testid')}"]`;
-                            }
-
-                            // Add other attributes
-                            if (el.name) selector += `[name="${el.name}"]`;
-                            if (el.type && el.type !== 'submit' && el.type !== 'button' && el.type !== '') {
-                                selector += `[type="${el.type}"]`;
-                            }
-                        }
-                        
-                        hierarchicalSelector = safeGetDOMPath(el);
-                    } catch (error) {
-                        debugMessage('Error generating selector', { element: el.tagName, error: error.message });
-                        selector = el.tagName.toLowerCase();
-                        hierarchicalSelector = selector;
-                    }
-                    
-                    // Enhanced text extraction
-                    let elementText = '';
-                    try {
-                        elementText = el.textContent?.trim() || '';
-                        if (!elementText && el.getAttribute('aria-label')) {
-                            elementText = el.getAttribute('aria-label');
-                        } else if (!elementText && el.getAttribute('title')) {
-                            elementText = el.getAttribute('title');
-                        } else if (!elementText && el.getAttribute('placeholder')) {
-                            elementText = el.getAttribute('placeholder');
-                        }
-                    } catch (error) {
-                        debugMessage('Error extracting text', error.message);
-                    }
-                    
-                    const elementData = {
-                        tag: el.tagName,
-                        type: el.type || '',
-                        role: el.getAttribute('role') || '',
-                        id: el.id || '',
-                        name: el.name || '',
-                        class: el.className || '',
-                        text_content: elementText,
-                        placeholder: el.placeholder || '',
-                        title: el.title || '',
-                        aria_label: el.getAttribute('aria-label') || '',
-                        value: el.value || '',
-                        label_text: safeGetLabelText(el),
-                        parent_text: safeGetParentText(el),
-                        css_selector: selector,
-                        hierarchical_selector: hierarchicalSelector,
-                        fallback_selector: el.tagName.toLowerCase(),
-                        text_xpath: elementText ? `//${el.tagName.toLowerCase()}[contains(text(), "${elementText}")]` : '',
-                        dom_path: hierarchicalSelector,
-                        container_context: containerContext,
-                        sibling_context: safeGetSiblingContext(el),
-                        interaction_hints: interactionHints,
-                        widget_data: {
-                            date_value: el.getAttribute('data-date'),
-                            option_value: el.getAttribute('data-value'),
-                            test_id: el.getAttribute('data-testid'),
-                            flight_data: el.getAttribute('data-flight'),
-                            price_data: el.getAttribute('data-price')
-                        },
-                        position: {
-                            x: Math.round(rect.x),
-                            y: Math.round(rect.y),
-                            width: Math.round(rect.width),
-                            height: Math.round(rect.height)
-                        }
-                    };
-                    
-                    elements.push(elementData);
-                    processedCount++;
-                    
-                } catch (error) {
-                    errorCount++;
-                    debugMessage('Error processing element', { 
-                        index: index, 
-                        element: el.tagName, 
-                        error: error.message 
-                    });
-                }
-            });
-            
-            debugMessage('Extraction complete', { 
-                processed: processedCount, 
-                errors: errorCount,
-                total: allElements.length 
-            });
-            
-            return {
-                elements: elements,
-                debugLog: debugLog,
-                stats: {
-                    processed: processedCount,
-                    errors: errorCount,
-                    total: allElements.length
-                }
-            };
-        }
-        """
+		await self._ensure_installed(page)
 
 		try:
-			result_str = await page.evaluate(js_code, debug_mode)
+			raw_result = await page.evaluate('window.__wfu_extract && window.__wfu_extract(arguments[0])', debug_mode)
 
-			# Parse the JSON result
+			if raw_result is None:
+				# add_init_script may not have fired yet on this Page; try one
+				# more install + invoke before giving up.
+				self._installed_pages.discard(id(page))
+				await self._ensure_installed(page)
+				raw_result = await page.evaluate('window.__wfu_extract && window.__wfu_extract(arguments[0])', debug_mode)
+
+			# Some Page implementations return JSON strings; normalise both.
 			import json
-
-			result = json.loads(result_str) if isinstance(result_str, str) else result_str
+			result = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+			if not result:
+				return []
 
 			if debug_mode and 'debugLog' in result:
-				# Save debug information to file
 				debug_file = f'semantic_extraction_debug_{int(asyncio.get_event_loop().time())}.json'
-				import json
-
 				async with aiofiles.open(debug_file, 'w') as f:
 					await f.write(json.dumps(result, indent=2))
 				logger.info(f'Debug information saved to: {debug_file}')
 
-				# Print debug stats
 				stats = result.get('stats', {})
 				logger.info(f'Extraction stats: {stats}')
 
@@ -802,7 +772,6 @@ class SemanticExtractor:
 
 		except Exception as e:
 			logger.error(f'Failed to extract interactive elements: {e}')
-			# Save error information for debugging
 			if debug_mode:
 				error_file = f'semantic_extraction_error_{int(asyncio.get_event_loop().time())}.txt'
 				async with aiofiles.open(error_file, 'w') as f:
