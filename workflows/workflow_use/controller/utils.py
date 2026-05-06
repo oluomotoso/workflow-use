@@ -1,6 +1,8 @@
 import logging
 import re
 
+from workflow_use.workflow.element_finder import _xpath_string_literal
+
 logger = logging.getLogger(__name__)
 
 
@@ -145,6 +147,10 @@ def generate_stable_xpaths(xpath, params=None):
 					attr_match = re.search(attr_pattern, params.cssSelector)
 					if attr_match:
 						attr_value = attr_match.group(1)
-						alternatives.append(f"//{element_tag}[contains(@{attr}, '{attr_value}')]")
+						# Use _xpath_string_literal to safely embed attr_value in the XPath
+						# expression. Raw f-string interpolation with single quotes lets a
+						# value containing ' or " escape its context.
+						escaped = _xpath_string_literal(attr_value)
+						alternatives.append(f'//{element_tag}[contains(@{attr}, {escaped})]')
 
 	return alternatives

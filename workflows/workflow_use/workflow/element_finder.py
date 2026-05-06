@@ -8,6 +8,7 @@ Uses semantic strategies with XPath fallback.
 Leverages browser-use's existing semantic finding through the controller.
 """
 
+import json
 import logging
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +16,61 @@ from typing import Any, Dict, List, Optional, Tuple
 from workflow_use.workflow.error_reporter import StrategyAttempt
 
 logger = logging.getLogger(__name__)
+
+
+def _xpath_string_literal(value: str) -> str:
+	"""
+	Return an XPath 1.0 string literal that is safe to embed in an XPath expression.
+
+	XPath 1.0 has no character-escape mechanism for quotes inside string literals.
+	When a value contains both ' and ", the only correct option is to split on
+	the quote characters and emit a ``concat(...)`` expression that the XPath
+	engine treats purely as a string literal — never as syntax.
+
+	Rules:
+	* No single quotes in value -> wrap in single quotes: ``'value'``.
+	* No double quotes in value -> wrap in double quotes: ``"value"``.
+	* Contains both -> emit ``concat('piece1', "'", 'piece2', '"', 'piece3')``.
+
+	This closes a class of selector-injection issues where an attacker-controlled
+	DOM attribute (id, aria-label, data-testid value) could escape its context
+	and pivot to unintended elements during workflow replay.
+
+	Examples:
+	    >>> _xpath_string_literal('hello')
+	    "'hello'"
+	    >>> _xpath_string_literal("it's")
+	    'concat(\\'it\\', "\\'", \\'s\\')'
+	    >>> _xpath_string_literal('say "hi"')
+	    '\\'say "hi"\\''
+	"""
+	if "'" not in value:
+		return f"'{value}'"
+	if '"' not in value:
+		return f'"{value}"'
+
+	# Contains both ' and ". Split on the single quote character; emit a
+	# concat() that interleaves the value pieces with literal "'" tokens.
+	pieces = value.split("'")
+	parts: List[str] = []
+	for i, piece in enumerate(pieces):
+		if piece:
+			parts.append(f"'{piece}'")
+		if i < len(pieces) - 1:
+			parts.append('"\'"')
+	return f'concat({", ".join(parts)})'
+
+
+def _js_string_literal(value: str) -> str:
+	"""
+	Return a JavaScript string literal that is safe to embed in a JS source.
+
+	Uses ``json.dumps`` so quotes, backslashes, newlines, and unicode are all
+	encoded according to the JSON spec — which is a strict subset of JS string
+	syntax. Replaces fragile ``str.replace("'", "\\\\'")`` style escapes that
+	break on values containing both single and double quotes.
+	"""
+	return json.dumps(value)
 
 
 class ElementFinder:
@@ -464,13 +520,16 @@ class ElementFinder:
 
 			logger.info(f'         🔎 Executing XPath: {normalized_xpath}')
 
-			# Execute XPath query via JavaScript to find element
-			# Escape the XPath for safe JavaScript string usage
-			escaped_xpath = normalized_xpath.replace("'", "\\'")
+			# Execute XPath query via JavaScript to find element.
+			# Use json.dumps via _js_string_literal so the embedded string is
+			# safe regardless of which quote characters appear in the XPath
+			# (the previous str.replace("'", "\\'") form breaks on values that
+			# contain both ' and ").
+			xpath_js_literal = _js_string_literal(normalized_xpath)
 			js_code = f"""() => {{
 	try {{
 		const result = document.evaluate(
-			'{escaped_xpath}',
+			{xpath_js_literal},
 			document,
 			null,
 			XPathResult.FIRST_ORDERED_NODE_TYPE,
@@ -494,7 +553,7 @@ class ElementFinder:
 			visible: isVisible,
 			tag: element.tagName,
 			text: element.textContent?.trim() || '',
-			xpath: '{escaped_xpath}'
+			xpath: {xpath_js_literal}
 		}};
 	}} catch (error) {{
 		return {{ error: error.message }};

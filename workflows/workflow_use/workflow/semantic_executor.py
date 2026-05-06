@@ -773,12 +773,16 @@ class SemanticWorkflowExecutor:
 				# Click the element using JavaScript evaluation
 				try:
 					if strategy_used.get('type') == 'xpath':
-						# Click via JavaScript using XPath
-						escaped_xpath = xpath_or_selector.replace("'", "\\'")
+						# Click via JavaScript using XPath. Use _js_string_literal so
+						# the embedded XPath is JS-safe regardless of which quote
+						# characters appear in it.
+						from workflow_use.workflow.element_finder import _js_string_literal
+
+						xpath_js_literal = _js_string_literal(xpath_or_selector)
 						click_js = f"""() => {{
 	try {{
 		const result = document.evaluate(
-			'{escaped_xpath}',
+			{xpath_js_literal},
 			document,
 			null,
 			XPathResult.FIRST_ORDERED_NODE_TYPE,
