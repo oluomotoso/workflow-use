@@ -1011,38 +1011,22 @@ Extracted Information:"""
 		)
 
 	async def run_as_tool(self, prompt: str) -> str:
-		"""Run the workflow with inputs parsed from a natural language prompt.
+		"""Disabled in the cache-replay branch.
 
-		Args:
-			prompt: Natural language description of the task and inputs
+		Deterministic-replay setups bind workflow parameters from explicit
+		caller arguments, not LLM prompt parsing. Removing the LLM-driven
+		input extraction keeps the public API focused on the deterministic
+		``Workflow.run(inputs=...)`` entry point and eliminates a load-bearing
+		LLM call from setups that don't have an LLM available at run time.
 
-		Returns:
-			JSON string with workflow results
+		Callers that want LLM-driven input extraction should wrap
+		``Workflow.run()`` with their own LLM router.
 		"""
-		if self.llm is None:
-			raise ValueError('LLM is required for run_as_tool to parse inputs from prompt')
-
-		# Parse inputs from prompt using LLM
-		input_model = self._build_input_model()
-
-		system_prompt = f"""You are a helpful assistant that extracts workflow input parameters from user prompts.
-The workflow requires the following inputs:
-{json.dumps(input_model.model_json_schema(), indent=2)}
-
-Extract the values from the user's prompt and return them in the required format."""
-
-		messages = [SystemMessage(content=system_prompt), UserMessage(content=prompt)]
-
-		response = await self.llm.ainvoke(messages, output_format=input_model)
-		inputs = response.completion.model_dump()
-
-		# Run the workflow with parsed inputs
-		result = await self.run(inputs=inputs, close_browser_at_end=True)
-
-		# Return results as JSON
-		output = {'success': True, 'steps_executed': len(result.step_results), 'inputs_used': inputs, 'context': self.context}
-
-		return json.dumps(output, indent=2)
+		raise NotImplementedError(
+			'run_as_tool is disabled in the cache-replay branch; '
+			'pass the inputs dict to Workflow.run(inputs=...) instead. '
+			'For LLM-driven input extraction, build your own router on top of run().'
+		)
 
 	async def run_with_no_ai(
 		self,
