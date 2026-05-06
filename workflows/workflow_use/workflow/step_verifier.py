@@ -75,10 +75,22 @@ class StepVerifier:
 		"""
 		Initialize step verifier.
 
+		The AI-assisted (``AI_ASSISTED``) and hybrid (``HYBRID``) verification
+		methods only fire when an LLM is explicitly passed in. The default
+		``llm=None`` keeps the verifier on the deterministic-only path —
+		useful for any deterministic-replay setup that wants to keep the
+		replay path LLM-free and only opt into AI verification for specific
+		high-stakes steps.
+
 		Args:
-		    llm: Optional language model for AI-assisted verification
+		    llm: Optional language model for AI-assisted verification.
+		         When ``None`` (the default), only DETERMINISTIC checks run;
+		         AI_ASSISTED checks are skipped at registration time and
+		         HYBRID checks fall back to deterministic-only.
 		"""
 		self.llm = llm
+		if llm is None:
+			logger.debug('StepVerifier initialised without LLM — DETERMINISTIC-only mode')
 
 	async def verify_step(
 		self, step: Any, browser_session: Any, pre_state: Optional[Dict[str, Any]] = None
