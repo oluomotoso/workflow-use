@@ -47,7 +47,7 @@ class Workflow:
 		controller: WorkflowController | None = None,
 		browser: Browser | None = None,
 		page_extraction_llm: BaseChatModel | None = None,
-		fallback_to_agent: bool = True,
+		fallback_to_agent: bool = False,
 		use_cloud: bool = False,
 		debug: bool = False,
 		debug_log_folder: str | Path | None = None,
@@ -60,7 +60,9 @@ class Workflow:
 			controller: Optional WorkflowController instance to handle action execution
 			browser: Optional Browser instance to use for browser automation
 			llm: Optional language model for fallback agent functionality
-			fallback_to_agent: Whether to fall back to agent-based execution on step failure
+			fallback_to_agent: Deprecated in the cache-replay branch. Retained for
+				backward-compatible signatures; deterministic step failures always
+				propagate now (see _execute_step). Default flipped to False.
 			use_cloud: Whether to use browser-use cloud browser service instead of local browser
 			debug: Whether to enable debug mode (captures screenshots for each step)
 			debug_log_folder: Custom folder path for debug logs and screenshots (default: ./logs/workflow_debug)
@@ -418,79 +420,14 @@ Extracted Information:"""
 			include_in_memory=True,
 		)
 
-	# async def _fallback_to_agent(
-	# 	self,
-	# 	step_resolved: WorkflowStep,
-	# 	step_index: int,
-	# 	error: Exception | str | None = None,
-	# ) -> AgentHistoryList:
-	# 	"""Handle step failure by delegating to an agent."""
-
-	# 	# print('Workflow steps:', step_resolved)
-	# 	# Extract details from the failed step dictionary
-	# 	failed_action_name = step_resolved.type
-	# 	failed_params = step_resolved.model_dump()
-	# 	step_description = step_resolved.description or 'No description provided'
-	# 	error_msg = str(error) if error else 'Unknown error'
-	# 	total_steps = len(self.steps)
-	# 	fail_details = (
-	# 		f"step={step_index + 1}/{total_steps}, action='{failed_action_name}', "
-	# 		f"description='{step_description}', params={str(failed_params)}, error='{error_msg}'"
-	# 	)
-
-	# 	# Determine the failed_value based on step type and attributes
-	# 	failed_value = None
-	# 	description_prefix = f'Purpose: {step_description}. ' if step_description else ''
-
-	# 	if isinstance(step_resolved, NavigationStep):
-	# 		failed_value = f'{description_prefix}Navigate to URL: {step_resolved.url}'
-	# 	elif isinstance(step_resolved, ClickStep):
-	# 		# element_info = step_resolved.elementText or step_resolved.cssSelector
-	# 		# failed_value = f"{description_prefix}Click element: {element_info}"
-	# 		failed_value = f'Find and click element with description: {step_resolved.description}'
-	# 	elif isinstance(step_resolved, InputStep):
-	# 		failed_value = f"{description_prefix}Input text: '{step_resolved.value}' into element."
-	# 	elif isinstance(step_resolved, SelectChangeStep):
-	# 		failed_value = f"{description_prefix}Select option: '{step_resolved.selectedText}' in dropdown."
-	# 	elif isinstance(step_resolved, KeyPressStep):
-	# 		failed_value = f"{description_prefix}Press key: '{step_resolved.key}'"
-	# 	elif isinstance(step_resolved, ScrollStep):
-	# 		failed_value = f'{description_prefix}Scroll to position: (x={step_resolved.scrollX}, y={step_resolved.scrollY})'
-	# 	else:
-	# 		failed_value = f"{description_prefix}No specific target value available for action '{failed_action_name}'"
-
-	# 	# Build workflow overview using the stored dictionaries
-	# 	workflow_overview_lines: list[str] = []
-	# 	for idx, step in enumerate(self.steps):
-	# 		desc = step.description or ''
-	# 		step_type_info = step.type
-	# 		details = step.model_dump()
-	# 		workflow_overview_lines.append(f'  {idx + 1}. ({step_type_info}) {desc} - {details}')
-	# 	workflow_overview = '\n'.join(workflow_overview_lines)
-	# 	# print(workflow_overview)
-
-	# 	# Build the fallback task with the failed_value
-	# 	fallback_task = WORKFLOW_FALLBACK_PROMPT_TEMPLATE.format(
-	# 		step_index=step_index + 1,
-	# 		total_steps=len(self.steps),
-	# 		workflow_details=workflow_overview,
-	# 		action_type=failed_action_name,
-	# 		fail_details=fail_details,
-	# 		failed_value=failed_value,
-	# 		step_description=step_description,
-	# 	)
-	# 	logger.info(f'Agent fallback task: {fallback_task}')
-
-	# 	# Prepare agent step config based on the failed step, adding task
-	# 	agent_step_config = AgenticWorkflowStep(
-	# 		type='agent',
-	# 		task=fallback_task,
-	# 		max_steps=5,
-	# 		output=None,
-	# 		description='Fallback agent to handle step failure',
-	# 	)
-
-	# 	return await self._run_agent_step(agent_step_config)
+	# _fallback_to_agent removed in the cache-replay branch.
+	#
+	# Deterministic step failures must propagate to the caller — escalating
+	# silently to an LLM-driven Agent contradicts the cache-replay contract
+	# (a cache hit must never bill the caller for a fresh LLM run on the
+	# failure path). Callers that want fallback escalation should catch the
+	# raised ValueError and decide for themselves whether to retry with an
+	# agent, invalidate the cached workflow, or surface the failure.
 
 	def _validate_inputs(self, inputs: dict[str, Any]) -> None:
 		"""Validate provided inputs against the workflow's input schema definition."""
@@ -660,7 +597,11 @@ Extracted Information:"""
 						)
 					result = await self._semantic_executor.execute_step(step_resolved)
 				else:
-					# Use deterministic controller execution
+					# Use deterministic controller execution. The cache-replay
+					# branch deliberately surfaces the original failure rather
+					# than escalating to an LLM-driven Agent — replay must stay
+					# pure-deterministic so cache hits never silently bill an
+					# LLM run on the failure path.
 					try:
 						logger.info(f'Attempting deterministic action: {action_name}')
 						result = await self._run_deterministic_step(step_resolved, step_index)
@@ -669,12 +610,12 @@ Extracted Information:"""
 							raise ValueError(f'Deterministic action {action_name} failed: {result.error}')
 					except Exception as e:
 						action_name = step_resolved.type or '[Unknown Action]'
-						logger.warning(
-							f'Deterministic step {step_index + 1} ({action_name}) failed: {e}. Attempting fallback with agent.'
-						)
-						raise ValueError(f'Deterministic step {step_index + 1} ({action_name}) failed: {e}')
+						raise ValueError(
+							f'Deterministic step {step_index + 1} ({action_name}) failed: {e}'
+						) from e
 			else:
-				# Use deterministic controller execution for all other actions
+				# Use deterministic controller execution for all other actions.
+				# Same cache-replay contract as above — failures propagate.
 				try:
 					logger.info(f'Attempting deterministic action: {action_name}')
 					result = await self._run_deterministic_step(step_resolved, step_index)
@@ -683,20 +624,16 @@ Extracted Information:"""
 						raise ValueError(f'Deterministic action {action_name} failed: {result.error}')
 				except Exception as e:
 					action_name = step_resolved.type or '[Unknown Action]'
-					logger.warning(
-						f'Deterministic step {step_index + 1} ({action_name}) failed: {e}. Attempting fallback with agent.'
-					)
-					raise ValueError(f'Deterministic step {step_index + 1} ({action_name}) failed: {e}')
-
-				# if self.fallback_to_agent:
-				# 	result = await self._fallback_to_agent(step_resolved, step_index, e)
-				# 	if not result.is_successful():
-				# 		raise ValueError(f'Deterministic step {step_index + 1} ({action_name}) failed even after fallback')
-				# else:
-				# 	raise ValueError(f'Deterministic step {step_index + 1} ({action_name}) failed: {e}')
+					raise ValueError(
+						f'Deterministic step {step_index + 1} ({action_name}) failed: {e}'
+					) from e
 
 		elif isinstance(step_resolved, AgenticWorkflowStep):
-			# Use task key from step dictionary
+			# AgenticWorkflowStep is an explicit opt-in step type that routes
+			# to the dedicated Agent handler. This is NOT the implicit
+			# fallback path — it is a workflow author's deliberate choice to
+			# include an LLM-driven step. Failures still propagate; we do not
+			# re-fallback to a second agent run.
 			task_description = step_resolved.task
 			logger.info(f'Running agent task: {task_description}')
 			try:
@@ -704,18 +641,8 @@ Extracted Information:"""
 				if not result.is_successful():
 					logger.warning(f'Agent step {step_index + 1} failed evaluation.')
 					raise ValueError(f'Agent step {step_index + 1} failed evaluation.')
-
 			except Exception as e:
-				raise ValueError(f'Agent step {step_index + 1} failed: {e}. (Agent fallback is disabled)')
-
-				if self.fallback_to_agent:
-					logger.warning(f'Agent step {step_index + 1} failed: {e}. Attempting fallback with agent.')
-
-					# result = await self._fallback_to_agent(step_resolved, step_index, e)
-					# if not result.is_successful():
-					# 	raise ValueError(f'Agent step {step_index + 1} failed even after fallback')
-				else:
-					raise ValueError(f'Agent step {step_index + 1} failed: {e}')
+				raise ValueError(f'Agent step {step_index + 1} failed: {e}') from e
 
 		return result
 
